@@ -7,8 +7,9 @@ https://huggingface.co/models?filter=fill-mask
 
 import os
 import logging
+import torch
+import torch.nn as nn
 from transformers import (
-    CONFIG_MAPPING,
     MODEL_FOR_MASKED_LM_MAPPING,
     Trainer,
     is_torch_tpu_available,
@@ -31,6 +32,7 @@ parser.add_argument('--run_name', type=str, default="mlm_1122")
 parser.add_argument('--from_scratch', type=int, default=0)
 parser.add_argument('--attn_var', type=str, default="")
 parser.add_argument('--n_heads', type=int, default=12)
+parser.add_argument('--n_blocks', type=int, default=12)
 parser.add_argument('--head_dim', type=int, default=64)
 parser.add_argument('--layer_indices', nargs='+', default=[-1], type=int, help='an integer for the accumulator')
 args, _ = parser.parse_known_args()
@@ -44,30 +46,42 @@ else:
     args.run_name += f"_RI"
 
 if any(element in range(1,13) for element in args.layer_indices):
-    args.run_name += f"_L{''.join(str(number) for number in args.layer_indices)}"
+    if args.n_blocks in range(1,12):
+        raise ValueError("Please specify either layer indices or number of blocks")
+    else:
+        args.run_name += f"_L{''.join(str(number) for number in args.layer_indices)}"
 elif 99 in args.layer_indices:
     args.run_name += f"_bl"
     args.layer_indices = []
 elif 100 in args.layer_indices:
-    args.run_name += f"_Lall"
-    args.layer_indices = range(1,13)
+    if args.n_blocks == 12:
+        args.run_name += f"_Lall"
+        args.layer_indices = range(1,13)
+    elif args.n_blocks in range(1,12):
+        args.run_name += f"_B{args.n_blocks}"
+    else:
+        raise ValueError("Please specify valid number of blocks")
 else:
     raise ValueError("Please specify the layer indices")
 
-if args.n_heads != 12:
-    args.run_name += f"_H{args.n_heads}"
-
-args.run_name += f"_H{args.n_heads}_OLD"
-
+if args.n_heads != 12: args.run_name += f"_H{args.n_heads}"
 
 training_args.run_name = args.run_name
 training_args.output_dir = os.path.join(training_args.output_dir, args.run_name)
 if "mlm_1122" not in training_args.run_name: assert 0 == 1, f"Please make sure about the name of model"
 print(f"Session Name: {training_args.run_name}")
 print(f"Output Dir: {training_args.output_dir}")
-# ========== NEW FEATURE: attn_conv_val ==========
-import torch
-import torch.nn as nn
+
+
+
+
+
+class RobertaSelfAttention_identity(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, hidden_states, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, past_key_value=None, output_attentions=False):
+        return (hidden_states, attention_probs) if output_attentions else (hidden_states,)
+    
 
 class RobertaSelfAttention_matchKV(nn.Module):
     def __init__(self, args):
@@ -141,9 +155,19 @@ def replace_layer(model, args):
         print(f"Layer {layer_index}: ")
         model.roberta.encoder.layer[layer_index-1].attention.self = RobertaSelfAttention_matchKV(args)
         
-replace_layer(model, args)
-
-
+def replace_layer_trimmed(model, args):
+    for layer_index in range(1, args.n_blocks + 1):
+        old_module = model.roberta.encoder.layer[layer_index-1].attention.self
+        args.hidden_size = old_module.num_attention_heads * old_module.attention_head_size
+        print(f"Layer {layer_index}: ")
+        model.roberta.encoder.layer[layer_index-1].attention.self = RobertaSelfAttention_matchKV(args)
+        
+    for layer_index in range(args.n_blocks + 1, 13):
+        print(f"Layer {layer_index}: set to identity")
+        model.roberta.encoder.layer[layer_index-1].attention.self = RobertaSelfAttention_identity()
+        
+if args.n_blocks == 12: replace_layer(model, args)
+else: replace_layer_trimmed(model, args)
 # ========== NEW FEATURE: attn_conv_val ==========
 
 
