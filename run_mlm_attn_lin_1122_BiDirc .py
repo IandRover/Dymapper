@@ -31,10 +31,11 @@ parser = argparse.ArgumentParser(description='Process some integers.')
 parser.add_argument('--run_name', type=str, default="mlm_1122")
 parser.add_argument('--from_scratch', type=int, default=0)
 parser.add_argument('--attn_var', type=str, default="")
-parser.add_argument('--n_heads', type=int, default=12)
 parser.add_argument('--n_blocks', type=int, default=12)
+parser.add_argument('--n_registers', type=int, default=2)
+parser.add_argument('--n_heads', type=int, default=12)
 parser.add_argument('--head_dim', type=int, default=64)
-parser.add_argument('--layer_indices', nargs='+', default=[-1], type=int, help='an integer for the accumulator')
+parser.add_argument('--layer_indices', nargs='+', default=[100], type=int, help='an integer for the accumulator')
 args, _ = parser.parse_known_args()
 
 from utils_mlm.misc import misc
@@ -44,12 +45,9 @@ if args.from_scratch == 0:
     args.run_name += f"_FT"
 else:
     args.run_name += f"_RI"
-
+    
 if any(element in range(1,13) for element in args.layer_indices):
-    if args.n_blocks in range(1,12):
-        raise ValueError("Please specify either layer indices or number of blocks")
-    else:
-        args.run_name += f"_L{''.join(str(number) for number in args.layer_indices)}"
+    args.run_name += f"_L{''.join(str(number) for number in args.layer_indices)}"
 elif 99 in args.layer_indices:
     args.run_name += f"_bl"
     args.layer_indices = []
@@ -64,7 +62,13 @@ elif 100 in args.layer_indices:
 else:
     raise ValueError("Please specify the layer indices")
 
-if args.n_heads != 12: args.run_name += f"_H{args.n_heads}"
+if args.n_registers in [1, 2,3,4]:
+    args.run_name += f"_nR{args.n_registers}"
+else:
+    raise ValueError("Please specify valid number of registers")
+
+if args.n_heads != 12:
+    args.run_name += f"_nH{args.n_heads}"
 
 training_args.run_name = args.run_name
 training_args.output_dir = os.path.join(training_args.output_dir, args.run_name)
@@ -99,8 +103,8 @@ class RobertaSelfAttention_matchKV(nn.Module):
         print(f"\t module type: {args.run_name}")
         self.run_name = args.run_name
 
-        num_unidirectional_register = 2
-        self.bidirection_weight = nn.Parameter(torch.ones((1,1,self.num_attention_heads,1,num_unidirectional_register*2))*(1/num_unidirectional_register/2))
+        self.n_registers = args.n_registers
+        self.bidirection_weight = nn.Parameter(torch.ones((1,1,self.num_attention_heads,1,self.n_registers*2))*(1/self.n_registers/2))
         self.ReadingHead = nn.Parameter(torch.zeros((self.num_attention_heads, self.attention_head_size)))
         
         nn.init.xavier_normal_(self.ReadingHead)
@@ -115,33 +119,29 @@ class RobertaSelfAttention_matchKV(nn.Module):
         V1 = self.transpose_for_scores(self.act(self.V1(hidden_states)))
 
         bs, length, n_head, hd = K1.shape
-        dot_products = torch.einsum('blnh,nh->bln', K1, self.ReadingHead)
+        dot_products = torch.einsum('blhn,hn->blh', K1, self.ReadingHead)
         valid_mask = dot_products > 0.5
         new_states = torch.zeros_like(K1).to(DEVICE)
 
-        forward_valids = torch.full((bs, n_head, 2), 0, dtype=torch.long).to(DEVICE)
-        forward_mmap = torch.full((bs, length, 2, n_head), 0, dtype=torch.long).to(DEVICE)
-        backward_valids = torch.full((bs, n_head, 2), 0, dtype=torch.long).to(DEVICE)
-        backward_mmap = torch.full((bs, length, 2, n_head), 0, dtype=torch.long).to(DEVICE)
+        forward_valids = torch.full((bs, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
+        backward_valids = torch.full((bs, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
+        forward_mmap = torch.full((bs, length, self.n_registers, n_head), 0, dtype=torch.long).to(DEVICE)
+        backward_mmap = torch.full((bs, length, self.n_registers, n_head), 0, dtype=torch.long).to(DEVICE)
 
         for len_index in range(1,length):
-            current_valid_mask = valid_mask[:, len_index, :]
-            forward_valids[:, :, 1] = torch.where(current_valid_mask, forward_valids[:, :, 0], forward_valids[:, :, 1])
-            forward_valids[:, :, 0] = torch.where(current_valid_mask, len_index, forward_valids[:, :, 0])
-            forward_mmap[:, len_index, 0, :] = forward_valids[:, :, 0]
-            forward_mmap[:, len_index, 1, :] = forward_valids[:, :, 1]
-        forward_mmap = forward_mmap.view(bs, length*2, n_head, 1).expand(-1, -1, -1, hd) # > (bs, length*2, n_head, hd)
+            forward_valids[:, 0] = len_index 
+            forward_valids[:, 1:] = torch.where(valid_mask[:, len_index].unsqueeze(1).expand(-1,self.n_registers,-1), forward_valids[:, :-1], forward_valids[:, 1:])
+            forward_mmap[:, len_index] = forward_valids[:, 1:]
+        forward_mmap = forward_mmap.view(bs, length*self.n_registers, n_head, 1).expand(-1, -1, -1, hd)
 
         for len_index in reversed(range(1,length)):
-            current_valid_mask = valid_mask[:, len_index, :]
-            backward_valids[:, :, 1] = torch.where(current_valid_mask, backward_valids[:, :, 0], backward_valids[:, :, 1])
-            backward_valids[:, :, 0] = torch.where(current_valid_mask, len_index, backward_valids[:, :, 0])
-            backward_mmap[:, len_index, 0, :] = backward_valids[:, :, 0]
-            backward_mmap[:, len_index, 1, :] = backward_valids[:, :, 1]
-        backward_mmap = backward_mmap.view(bs, length*2, n_head, 1).expand(-1, -1, -1, hd) # > (bs, length*2, n_head, hd)
+            backward_valids[:, 0] = len_index
+            backward_valids[:, 1:] = torch.where(valid_mask[:, len_index].unsqueeze(1).expand(-1,self.n_registers,-1), backward_valids[:, :-1], backward_valids[:, 1:])
+            backward_mmap[:, len_index] = backward_valids[:, 1:]
+        backward_mmap = backward_mmap.view(bs, length*self.n_registers, n_head, 1).expand(-1, -1, -1, hd)
 
-        V_forward = torch.gather(V1, 1, forward_mmap).view(bs, length, 2, n_head, hd)
-        V_backward = torch.gather(V1, 1, backward_mmap).view(bs, length, 2, n_head, hd)
+        V_forward = torch.gather(V1, 1, forward_mmap).view(bs, length, self.n_registers, n_head, hd)
+        V_backward = torch.gather(V1, 1, backward_mmap).view(bs, length, self.n_registers, n_head, hd)
         new_states = torch.cat([V_forward, V_backward], dim=2).permute(0,1,3,4,2) * self.bidirection_weight    
         context_layer = new_states.sum(dim=-1).view(bs, length, -1)
 
@@ -168,7 +168,6 @@ def replace_layer_trimmed(model, args):
         
 if args.n_blocks == 12: replace_layer(model, args)
 else: replace_layer_trimmed(model, args)
-# ========== NEW FEATURE: attn_conv_val ==========
 
 
 # Initialize our Trainer
