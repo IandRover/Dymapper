@@ -5,8 +5,10 @@ https://huggingface.co/models?filter=fill-mask
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
-import os
+import os 
 import logging
+logging.disable(logging.INFO) 
+
 import torch
 import torch.nn as nn
 from transformers import (
@@ -70,6 +72,9 @@ else:
 if args.n_heads != 12:
     args.run_name += f"_nH{args.n_heads}"
 
+if args.attn_var != "":
+    args.run_name += f"_{args.attn_var}"
+
 training_args.run_name = args.run_name
 training_args.output_dir = os.path.join(training_args.output_dir, args.run_name)
 if "mlm_1122" not in training_args.run_name: assert 0 == 1, f"Please make sure about the name of model"
@@ -107,10 +112,22 @@ class RobertaSelfAttention_matchKV(nn.Module):
         self.bidirection_weight = nn.Parameter(torch.ones((1,1,self.num_attention_heads,1,self.n_registers*2))*(1/self.n_registers/2))
         self.ReadingHead = nn.Parameter(torch.zeros((self.num_attention_heads, self.attention_head_size)))
         
+        self.attn_var = args.attn_var
+        if self.attn_var == "softmax15" or self.attn_var == "softmax30":
+            print("Using Softmax")
+            self.softmax = torch.nn.Softmax(dim=1)
+        if self.attn_var == "1softmax15" or self.attn_var == "1softmax30":
+            print("Using One-Softmax")
+        
         nn.init.xavier_normal_(self.ReadingHead)
 
     def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(x.size()[:-1] + (self.num_attention_heads, self.attention_head_size))
+
+    def _softmax1(self, x):
+        maxes = torch.max(x, 1, keepdim=True)[0]
+        x_exp = torch.exp(x-maxes)
+        return x_exp/torch.sum(x_exp, 1, keepdim=True) + 1 / torch.exp(maxes)
 
     def forward(self, hidden_states, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, past_key_value=None, output_attentions=False):
 
@@ -120,9 +137,18 @@ class RobertaSelfAttention_matchKV(nn.Module):
 
         bs, length, n_head, hd = K1.shape
         dot_products = torch.einsum('blhn,hn->blh', K1, self.ReadingHead)
-        valid_mask = dot_products > 0.5
+        if self.attn_var == "softmax15":
+            valid_mask = self.softmax(dot_products) > (1.5 / length)
+        elif self.attn_var == "softmax30":
+            valid_mask = self.softmax(dot_products) > (3.0 / length)
+        elif self.attn_var == "1softmax15":
+            valid_mask = self._softmax1(dot_products) > (1.5 / length)
+        elif self.attn_var == "1softmax30":
+            valid_mask = self._softmax1(dot_products) > (3.0 / length)
+        else:
+            valid_mask = dot_products > 0.5
         new_states = torch.zeros_like(K1).to(DEVICE)
-
+        
         forward_valids = torch.full((bs, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
         backward_valids = torch.full((bs, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
         forward_mmap = torch.full((bs, length, self.n_registers, n_head), 0, dtype=torch.long).to(DEVICE)
