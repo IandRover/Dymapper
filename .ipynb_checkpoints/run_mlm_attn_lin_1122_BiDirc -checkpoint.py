@@ -116,7 +116,7 @@ class RobertaSelfAttention_matchKV(nn.Module):
         if self.attn_var == "softmax15" or self.attn_var == "softmax30":
             print("Using Softmax")
             self.softmax = torch.nn.Softmax(dim=1)
-        if self.attn_var == "1softmax15" or self.attn_var == "1softmax30":
+        if self.attn_var == "1softmax15" or self.attn_var == "1softmax30" or self.attn_var == "1softmax15_PosIndex2":
             print("Using One-Softmax")
         
         nn.init.xavier_normal_(self.ReadingHead)
@@ -137,6 +137,7 @@ class RobertaSelfAttention_matchKV(nn.Module):
 
         bs, length, n_head, hd = K1.shape
         dot_products = torch.einsum('blhn,hn->blh', K1, self.ReadingHead)
+
         if self.attn_var == "softmax15":
             valid_mask = self.softmax(dot_products) > (1.5 / length)
         elif self.attn_var == "softmax30":
@@ -145,26 +146,48 @@ class RobertaSelfAttention_matchKV(nn.Module):
             valid_mask = self._softmax1(dot_products) > (1.5 / length)
         elif self.attn_var == "1softmax30":
             valid_mask = self._softmax1(dot_products) > (3.0 / length)
+        elif self.attn_var == "1softmax15_PosIndex2":
+            valid_mask = self._softmax1(dot_products) > (1.5 / length)
         else:
             valid_mask = dot_products > 0.5
         new_states = torch.zeros_like(K1).to(DEVICE)
         
-        forward_valids = torch.full((bs, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
-        backward_valids = torch.full((bs, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
-        forward_mmap = torch.full((bs, length, self.n_registers, n_head), 0, dtype=torch.long).to(DEVICE)
-        backward_mmap = torch.full((bs, length, self.n_registers, n_head), 0, dtype=torch.long).to(DEVICE)
 
-        for len_index in range(1,length):
-            forward_valids[:, 0] = len_index 
-            forward_valids[:, 1:] = torch.where(valid_mask[:, len_index].unsqueeze(1).expand(-1,self.n_registers,-1), forward_valids[:, :-1], forward_valids[:, 1:])
-            forward_mmap[:, len_index] = forward_valids[:, 1:]
-        forward_mmap = forward_mmap.view(bs, length*self.n_registers, n_head, 1).expand(-1, -1, -1, hd)
+        if self.attn_var == "PosIndex2" or self.attn_var == "1softmax15_PosIndex2":
+            
+            forward_mmap = torch.full((bs, length, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
+            backward_mmap = torch.full((bs, length, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
 
-        for len_index in reversed(range(1,length)):
-            backward_valids[:, 0] = len_index
-            backward_valids[:, 1:] = torch.where(valid_mask[:, len_index].unsqueeze(1).expand(-1,self.n_registers,-1), backward_valids[:, :-1], backward_valids[:, 1:])
-            backward_mmap[:, len_index] = backward_valids[:, 1:]
-        backward_mmap = backward_mmap.view(bs, length*self.n_registers, n_head, 1).expand(-1, -1, -1, hd)
+            forward_mmap[:, :, 0] = (torch.arange(1,1+length)*1.).view(1,length,1).expand(-1,-1,n_head)
+            for len_index in range(1,length):
+                forward_mmap[:, len_index, 1:] = torch.where(valid_mask[:, len_index].unsqueeze(1).expand(-1,self.n_registers,-1), forward_mmap[:, len_index-1, :-1], forward_mmap[:, len_index-1, 1:])
+            forward_mmap = forward_mmap[:,:,1:].reshape(bs, length*self.n_registers, n_head, 1).expand(-1, -1, -1, hd)
+
+            backward_mmap[:, :, 0] = (torch.arange(0,length)*1.).view(1,length,1).expand(-1,-1,n_head)
+            backward_mmap[:, length - 1, 1] = torch.where(valid_mask[:, length - 1], length - 1, 0)
+            for len_index in reversed(range(1,length-1)):
+                backward_mmap[:, len_index, 1:] = torch.where(valid_mask[:, len_index].unsqueeze(1).expand(-1,self.n_registers,-1), backward_mmap[:, len_index+1, :-1], backward_mmap[:, len_index+1, 1:])
+            backward_mmap = backward_mmap[:,:,1:].reshape(bs, length*self.n_registers, n_head, 1).expand(-1, -1, -1, hd)
+        
+        else:
+
+            forward_valids = torch.full((bs, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
+            backward_valids = torch.full((bs, self.n_registers+1, n_head), 0, dtype=torch.long).to(DEVICE)
+            forward_mmap = torch.full((bs, length, self.n_registers, n_head), 0, dtype=torch.long).to(DEVICE)
+            backward_mmap = torch.full((bs, length, self.n_registers, n_head), 0, dtype=torch.long).to(DEVICE)
+
+            for len_index in range(1,length):
+                forward_valids[:, 0] = len_index 
+                forward_valids[:, 1:] = torch.where(valid_mask[:, len_index].unsqueeze(1).expand(-1,self.n_registers,-1), forward_valids[:, :-1], forward_valids[:, 1:])
+                forward_mmap[:, len_index] = forward_valids[:, 1:]
+            forward_mmap = forward_mmap.view(bs, length*self.n_registers, n_head, 1).expand(-1, -1, -1, hd)
+
+            for len_index in reversed(range(1,length)):
+                backward_valids[:, 0] = len_index
+                backward_valids[:, 1:] = torch.where(valid_mask[:, len_index].unsqueeze(1).expand(-1,self.n_registers,-1), backward_valids[:, :-1], backward_valids[:, 1:])
+                backward_mmap[:, len_index] = backward_valids[:, 1:]
+            backward_mmap = backward_mmap.view(bs, length*self.n_registers, n_head, 1).expand(-1, -1, -1, hd)
+
 
         V_forward = torch.gather(V1, 1, forward_mmap).view(bs, length, self.n_registers, n_head, hd)
         V_backward = torch.gather(V1, 1, backward_mmap).view(bs, length, self.n_registers, n_head, hd)
